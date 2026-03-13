@@ -36,7 +36,7 @@ bias      = False
 
 # optimizer
 learning_rate = 3e-4
-max_iters     = 15000          # ~4 hrs on T4; increase or resume for more
+max_iters     = 7600           # 2B tokens ÷ 262K tokens/step; ~4 hrs on T4/P100
 weight_decay  = 0.1
 beta1         = 0.9
 beta2         = 0.95
@@ -45,7 +45,7 @@ grad_clip     = 1.0
 # lr schedule — cosine decay with warmup
 decay_lr      = True
 warmup_iters  = 500
-lr_decay_iters= 15000
+lr_decay_iters= 7600
 min_lr        = 3e-5
 
 # system

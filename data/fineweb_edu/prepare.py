@@ -1,21 +1,15 @@
 """
-Prepare FineWeb-Edu (sample-10BT) for Ved training.
+Prepare FineWeb-Edu for Ved training — streaming edition.
 
-Downloads ~10B tokens of high-quality educational web text from HuggingFace,
-tokenises with the GPT-2 BPE tokeniser (tiktoken), and writes:
-    data/fineweb_edu/train.bin   — uint16 token ids
-    data/fineweb_edu/val.bin     — uint16 token ids
+Streams the dataset directly from HuggingFace without downloading the full
+~25 GB corpus to disk. Writes only as many tokens as you need.
+
+Default budget fits comfortably on Kaggle (~20 GB disk):
+    TRAIN_TOKENS = 2_000_000_000  → ~4 GB as uint16
+    VAL_TOKENS   =    10_000_000  → ~20 MB
 
 Usage (run from the repo root):
     python data/fineweb_edu/prepare.py
-
-Args you can override at the top of the file:
-    NUM_PROC       — parallel workers for tokenisation
-    VAL_SIZE       — number of documents held out for validation
-    SHARD_SIZE     — tokens per shard written to disk
-
-The script streams the dataset so it never loads everything into RAM at once.
-On a Kaggle T4 notebook this takes ~30-60 minutes depending on bandwidth.
 """
 
 import os
@@ -27,71 +21,82 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-NUM_PROC   = 4        # tokenisation workers
-VAL_SIZE   = 5_000   # documents reserved for validation
-SHARD_SIZE = int(1e8) # ~100M tokens per shard before flushing to disk
+TRAIN_TOKENS = 2_000_000_000   # 2B tokens  (~4 GB, fits on Kaggle)
+VAL_TOKENS   =    10_000_000   # 10M tokens (~20 MB)
+WRITE_EVERY  =   100_000_000   # flush to disk every 100M tokens
 # ---------------------------------------------------------------------------
 
-enc      = tiktoken.get_encoding("gpt2")
-EOT      = enc._special_tokens["<|endoftext|>"]  # document separator
+enc = tiktoken.get_encoding("gpt2")
+EOT = enc._special_tokens["<|endoftext|>"]
 
 DATA_DIR = os.path.dirname(__file__)
 
 
-def tokenise(doc):
-    tokens = [EOT]  # prepend EOT so every doc starts with a separator
-    tokens.extend(enc.encode_ordinary(doc["text"]))
-    return {"ids": tokens, "len": len(tokens)}
+def stream_to_bin(split_name: str, target_tokens: int):
+    out_path = os.path.join(DATA_DIR, f"{split_name}.bin")
 
+    if os.path.exists(out_path):
+        existing = os.path.getsize(out_path) // 2  # uint16 = 2 bytes
+        if existing >= target_tokens:
+            print(f"{split_name}: already have {existing:,} tokens, skipping.")
+            return
+        else:
+            print(f"{split_name}: found {existing:,} tokens, re-generating.")
+            os.remove(out_path)
 
-def write_bin(path, all_tokens):
-    arr = np.array(all_tokens, dtype=np.uint16)
-    arr.tofile(path)
-    print(f"wrote {len(arr):,} tokens → {path}")
+    print(f"\nStreaming FineWeb-Edu → {split_name}.bin  (target: {target_tokens:,} tokens)")
 
-
-def main():
-    print("Loading FineWeb-Edu (sample-10BT) in streaming mode …")
+    # Stream directly — no parquet files written to disk
     ds = load_dataset(
         "HuggingFaceFW/fineweb-edu",
         name="sample-10BT",
         split="train",
-        streaming=False,   # full download — Kaggle has plenty of disk
-        num_proc=NUM_PROC,
+        streaming=True,
     )
 
-    # Tokenise in parallel
-    print("Tokenising …")
-    tokenised = ds.map(
-        tokenise,
-        remove_columns=ds.column_names,
-        desc="tokenising",
-        num_proc=NUM_PROC,
-    )
+    # For val, skip the first TRAIN_TOKENS-worth of documents so it's held out
+    if split_name == "val":
+        # ~350 tokens/doc on average; skip roughly that many docs
+        skip_docs = TRAIN_TOKENS // 350
+        ds = ds.skip(skip_docs)
 
-    # Train / val split
-    split = tokenised.train_test_split(test_size=VAL_SIZE, seed=42)
+    buf          = []
+    total_written = 0
 
-    for name, subset in [("train", split["train"]), ("val", split["test"])]:
-        out_path = os.path.join(DATA_DIR, f"{name}.bin")
-        all_tokens = []
-        total = 0
-        for sample in tqdm(subset, desc=name):
-            all_tokens.extend(sample["ids"])
-            total += sample["len"]
-            if len(all_tokens) >= SHARD_SIZE:
-                # flush shard
-                arr = np.array(all_tokens, dtype=np.uint16)
+    with tqdm(total=target_tokens, unit="tok", unit_scale=True) as pbar:
+        for doc in ds:
+            tokens = [EOT] + enc.encode_ordinary(doc["text"])
+            buf.extend(tokens)
+
+            if len(buf) >= WRITE_EVERY:
+                chunk = np.array(buf[:WRITE_EVERY], dtype=np.uint16)
                 with open(out_path, "ab") as f:
-                    arr.tofile(f)
-                all_tokens = []
-        if all_tokens:
-            arr = np.array(all_tokens, dtype=np.uint16)
-            with open(out_path, "ab") as f:
-                arr.tofile(f)
-        print(f"{name}: {total:,} tokens")
+                    chunk.tofile(f)
+                total_written += WRITE_EVERY
+                pbar.update(WRITE_EVERY)
+                buf = buf[WRITE_EVERY:]
 
-    print("Done. Run training with:")
+                if total_written >= target_tokens:
+                    break
+
+    # Flush remainder (up to target)
+    remaining = min(len(buf), target_tokens - total_written)
+    if remaining > 0:
+        chunk = np.array(buf[:remaining], dtype=np.uint16)
+        with open(out_path, "ab") as f:
+            chunk.tofile(f)
+        total_written += remaining
+        pbar.update(remaining)
+
+    size_gb = os.path.getsize(out_path) / 1e9
+    print(f"{split_name}: {total_written:,} tokens written ({size_gb:.2f} GB)")
+
+
+def main():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    stream_to_bin("train", TRAIN_TOKENS)
+    stream_to_bin("val",   VAL_TOKENS)
+    print("\nDone. Run training with:")
     print("  python train.py config/train_ved.py")
 
 
